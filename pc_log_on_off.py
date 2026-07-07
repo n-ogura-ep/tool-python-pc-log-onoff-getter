@@ -1,173 +1,154 @@
-import os
+"""Windows PCのログオン・ログオフ履歴を抽出するモジュール。
+
+`wevtutil` コマンドでシステムイベントログ（EventID 7001: ログオン, 7002: ログオフ）を取得し、
+指定した開始日から現在までの日毎のログオン・ログオフ時刻および稼働時間を CSV ファイルへ出力する。
+"""
+
+from __future__ import annotations
+
+import datetime as dt
 import subprocess
-import pandas as pd
+from pathlib import Path
+
 import numpy as np
-import datetime
+import pandas as pd
+
+# ログオン/ログオフを表すイベントID
+EVENT_ID_LOGON = 7001
+EVENT_ID_LOGOFF = 7002
+
+# 抽出対象とするイベントの説明文
+TARGET_DESCRIPTIONS = [
+    "カスタマー エクスペリエンス向上プログラムのユーザー ログオン通知",
+    "カスタマー エクスペリエンス向上プログラムのユーザー ログオフ通知",
+]
+
+# 稼働時間の算出時に差し引く休憩時間（昼休み）
+LUNCH_BREAK = dt.timedelta(hours=1)
+
+# ログの取得・整形に使用するエンコーディング（日本語Windowsのwevtutil出力）
+LOG_ENCODING = "cp932"
+
+OUTPUT_DIR_NAME = "log_output"
+LOG_TXT_NAME = "log.txt"
+LOG_CSV_NAME = "log.csv"
+OUTPUT_CSV_NAME = "logon_off.csv"
 
 
-def get_log(start_date):
+def _parse_date(date_str: str) -> dt.datetime:
+    """ "2022 11 1" のようなスペース区切りの文字列を datetime へ変換する。"""
+    year, month, day = (int(part) for part in date_str.split())
+    return dt.datetime(year, month, day)
 
-    ### 1. 抽出区間の開始日と終了日を取得する
-    # スペースで分割して、文字列で取得
-    start_day_str_list = start_date.split()
 
-    # リストの各要素の文字列型を整数型へ変換
-    start_day = list(map(int, start_day_str_list))
-    print("start day: ", start_day)
-
-    # 現時点を終了日として自動取得する
-    now = datetime.datetime.now()
-    end_day_str_list = now.strftime("%Y %m %d").split()
-    end_day = list(map(int, end_day_str_list))
-    print("end_day: ", end_day)
-
-    # ファイルの保存先ディレクトリ
-    save_dir = os.path.join(
-        # os.environ["USERPROFILE"],
-        os.getcwd(),
-        "log_output",
+def _fetch_event_log(log_txt_path: Path) -> None:
+    """`wevtutil` コマンドでログオン/ログオフのイベントログを取得しテキスト保存する。"""
+    cmd = (
+        "wevtutil qe system /f:text /rd:true "
+        '/q:"*[*[EventID=7001 or EventID=7002]]" '
+        f'> "{log_txt_path}"'
     )
-    print("log output: ", save_dir)
+    subprocess.run(cmd, shell=True)
 
-    # フォルダがなければ作成する
-    os.makedirs(save_dir, exist_ok=True)
 
-    # ログファイルを保存するパス（一時ファイルとして使用）
-    logtxt_path = os.path.join(save_dir, "log.txt")
-    # print(logtxt_path)
+def _convert_log_to_csv(log_txt_path: Path, log_csv_path: Path) -> None:
+    """wevtutilの出力テキストを整形し、CSV形式へ変換する。"""
+    with (
+        log_txt_path.open("r", encoding=LOG_ENCODING) as f_in,
+        log_csv_path.open("w", encoding=LOG_ENCODING) as f_out,
+    ):
+        f_out.write("row_No,Date,Time,Event ID,Description\n")
+        in_description = False
+        for i, row in enumerate(f_in, start=1):
+            if "Date" in row:
+                date_part = row.strip()[6:]
+                date_ = date_part[:10]
+                time_ = date_part[11:19]
+                f_out.write(f"{i},{date_},{time_},")
+            elif "Event ID" in row:
+                f_out.write(f"{row.strip()[10:]},")
+            elif "Description" in row:
+                in_description = True
+            elif in_description:
+                f_out.write(row.strip() + "\n")
+                in_description = False
 
-    # ログファイルを整形してcsvファイルを作成するパス（一時ファイル）
-    logcsv_path = os.path.join(save_dir, "log.csv")
 
-    # 目的のログオン，オフ日時情報のcsvファイルを保存するパス
-    save_csv_path = os.path.join(save_dir, "logon_off.csv")
+def _load_and_filter_events(
+    log_csv_path: Path, start_day: dt.datetime, end_day: dt.datetime
+) -> pd.DataFrame:
+    """CSVを読み込み、対象イベントかつ指定期間内の行に絞り込む。"""
+    df = pd.read_csv(log_csv_path, encoding=LOG_ENCODING)
+    df = df[df["Description"].isin(TARGET_DESCRIPTIONS)].copy()
+    df["Date"] = pd.to_datetime(df["Date"])
+    return df[(df["Date"] >= start_day) & (df["Date"] <= end_day)]
 
-    ### 2. Windowsコマンド「wevtutil」により、イベントログを取得する
-    cmd = f'wevtutil qe system /f:text /rd:true /q:"*[*[EventID=7001 or EventID=7002]]" > ./log_output/log.txt'
-    # print(cmd)
-    subprocess.call(cmd, shell=True)
 
-    ### 3. ログファイルを整形してcsvファイルを作成する
-    with open(logtxt_path, "r") as f1:
-        with open(logcsv_path, "w") as f2:
-            f2.write(
-                "row_No,Date,Time,Event ID,Description\n"
-            )  # 文字列で書き込む場合は writeメソッドを使う
-            flag_Description = False
-            for i, row in enumerate(f1, start=1):
-                if "Date" in row:
-                    buf_date = row.strip()[
-                        6:
-                    ]  # stripメソッドで改行コードを削除（右端の文字列を消す）
-                    _date = buf_date[:10]
-                    _time = buf_date[11:19]
-                    f2.writelines(
-                        [str(i), ",", _date, ",", _time, ","]
-                    )  # リストで書き込む場合は writelinesメソッドを使う
-                elif "Event ID" in row:
-                    f2.writelines([row.strip()[10:], ","])
-                elif "Description" in row:
-                    flag_Description = True
-                elif flag_Description:
-                    f2.write(row.strip() + "\n")  # 文字列の最後に改行コードを付与
-                    flag_Description = False
+def _summarize_day(day_df: pd.DataFrame) -> tuple[object, object, object]:
+    """1日分のイベントから、ログオン時刻・ログオフ時刻・稼働時間を求める。"""
+    logon_times = day_df.loc[day_df["Event ID"] == EVENT_ID_LOGON, "Time"]
+    logoff_times = day_df.loc[day_df["Event ID"] == EVENT_ID_LOGOFF, "Time"]
 
-    # 作成したcsvファイルをpandasデータフレームで読み込む
-    df0 = pd.read_csv(logcsv_path, encoding="cp932")
-    # print(df0)
+    logon = logon_times.min() if not logon_times.empty else np.nan
+    logoff = logoff_times.max() if not logoff_times.empty else np.nan
 
-    # Descriptionの列に対して、ログオンとログオフの文字列がある行のみを残す
-    target_list = [
-        "カスタマー エクスペリエンス向上プログラムのユーザー ログオン通知",
-        "カスタマー エクスペリエンス向上プログラムのユーザー ログオフ通知",
-    ]
-    df = df0.query("Description in @target_list")
-    # print(df)
+    operating_time: object = np.nan
+    if isinstance(logon, str) and isinstance(logoff, str):
+        try:
+            operating_time = (
+                dt.datetime.strptime(logoff, "%H:%M:%S")
+                - dt.datetime.strptime(logon, "%H:%M:%S")
+                - LUNCH_BREAK
+            )
+        except ValueError:
+            operating_time = np.nan
 
-    # csvファイルに上書き保存する
-    df.to_csv(logcsv_path, index=False, encoding="cp932")
+    return logon, logoff, operating_time
 
-    ### 4. 指定区間を抽出して表示。また、csvファイルへ保存する
-    # 型変換（Date列を日付型へ変換）
-    df.loc[:, "Date"] = pd.to_datetime(df["Date"])
 
-    # 型確認
-    # print(df.dtypes)
+def _write_summary_csv(df: pd.DataFrame, save_csv_path: Path) -> None:
+    """日毎に集計したログオン・ログオフ・稼働時間をCSVへ出力する。
 
-    # 日付で区間を絞り込み
-    df = df[
-        df["Date"] >= datetime.datetime(*start_day)
-    ]  # 先頭のアスタリスクはlist形式のアンパックをしている
-    df = df[df["Date"] <= datetime.datetime(*end_day)]
-    # print(df)
+    1日中にPCを一時的にシャットダウンすることも想定し、
+    その日最も早い時刻をログオン、最も遅い時刻をログオフとして扱う。
+    """
+    with save_csv_path.open("w", encoding="utf-8") as f:
+        f.write("date,logon,logoff,operating_time\n")
+        for date_, day_df in df.groupby("Date"):
+            logon, logoff, operating_time = _summarize_day(day_df)
+            row = [date_.date().strftime("%Y/%m/%d"), logon, logoff, operating_time]
+            f.write(",".join(map(str, row)) + "\n")
 
-    # 日付のグループを取得（重複を省く）
-    date_list = list(df.groupby("Date").groups.keys())
-    # print("\n", date_list, "\n")
 
-    # ログオン，ログオフの日時をcsvへ出力する
-    with open(save_csv_path, "w") as f:
-        # print("date", "logon", "logoff", "operating_time")
-        col_list = ["date", "logon", "logoff", "operating_time"]
+def get_log(start_date: str) -> None:
+    """指定した開始日から現在までのログオン・ログオフ履歴を抽出しCSVへ保存する。
 
-        # リストの要素間にカンマを挿入して文字列にする
-        col_str = ",".join(map(str, col_list))
-        f.write(col_str + "\n")
+    Args:
+        start_date: "2022 11 1" のようなスペース区切りの日付文字列。
+    """
+    start_day = _parse_date(start_date)
+    end_day = dt.datetime.now()
+    print("start day:", start_day)
+    print("end day:", end_day)
 
-        # 各日に対して、最も早い時刻をログオン、最も遅い時刻をログオフとする
-        # 日中にPCを一時的にシャットダウンすることもあるかもしれない場合のため
-        for _date in date_list:
+    save_dir = Path.cwd() / OUTPUT_DIR_NAME
+    save_dir.mkdir(parents=True, exist_ok=True)
+    print("log output:", save_dir)
 
-            _df = df.groupby("Date").get_group(_date)
-            # print('\n', _df)
+    log_txt_path = save_dir / LOG_TXT_NAME
+    log_csv_path = save_dir / LOG_CSV_NAME
+    save_csv_path = save_dir / OUTPUT_CSV_NAME
 
-            # ログオン時刻から、その日の最初の時刻を抽出
-            try:
-                _logon_df = _df[_df["Event ID"] == 7001]
-                _t_min = _logon_df["Time"].min()
-            except:
-                _t_min = np.nan
-            # print('_t_min', _t_min)
+    _fetch_event_log(log_txt_path)
+    _convert_log_to_csv(log_txt_path, log_csv_path)
 
-            # ログオフ時刻から、その日の最後の時刻を抽出
-            try:
-                _logoff_df = _df[_df["Event ID"] == 7002]
-                _t_max = _logoff_df["Time"].max()
-            except:
-                _t_max = np.nan
-            # print('_t_max', _t_max)
+    df = _load_and_filter_events(log_csv_path, start_day, end_day)
+    _write_summary_csv(df, save_csv_path)
 
-            # 稼働時間の計算
-            try:
-                _t_time = (
-                    datetime.datetime.strptime(_t_max, "%H:%M:%S")
-                    - datetime.datetime.strptime(_t_min, "%H:%M:%S")
-                    + datetime.timedelta(hours=-1)
-                )  # 1時間を引く（昼休み）
-                _date_list = [
-                    _date.date().strftime("%Y/%m/%d"),
-                    _t_min,
-                    _t_max,
-                    _t_time,
-                ]
-            except:
-                _date_list = [_date.date().strftime("%Y/%m/%d"), _t_min, _t_max, np.nan]
-
-            # 型を文字列へ変換
-            _date_list = list(map(str, _date_list))
-            _date_str = ",".join(map(str, _date_list))
-
-            # csvファイルへ書き込む
-            f.write(_date_str + "\n")
-            # print(*_date_list)
-
-    ### 5. 一時ファイルを削除する
-    os.remove(logtxt_path)
-    os.remove(logcsv_path)
+    log_txt_path.unlink(missing_ok=True)
+    log_csv_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
-
-    txt = input("開始日を入力下さい。スペース区切り。 例) 2022 11 1 \n")
-
-    get_log(txt)
+    user_input = input("開始日を入力下さい。スペース区切り。 例) 2022 11 1 \n")
+    get_log(user_input)
