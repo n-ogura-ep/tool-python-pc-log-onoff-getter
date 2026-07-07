@@ -14,3 +14,8 @@ dependencies = [
     "tzdata>=2025.2",
     "wheel>=0.45.1",
 ]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.20",
+]
