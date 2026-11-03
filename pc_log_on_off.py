@@ -70,7 +70,7 @@ def _convert_log_to_csv(log_txt_path: Path, log_csv_path: Path) -> None:
             elif "Description" in row:
                 in_description = True
             elif in_description:
-                f_out.write(row.strip() + "\n")
+                f_out.write(row.replace("\x00", "").strip() + "\n")
                 in_description = False
 
 
@@ -79,6 +79,9 @@ def _load_and_filter_events(
 ) -> pd.DataFrame:
     """CSVを読み込み、対象イベントかつ指定期間内の行に絞り込む。"""
     df = pd.read_csv(log_csv_path, encoding=LOG_ENCODING)
+    df["Description"] = (
+        df["Description"].astype(str).str.replace("\x00", "", regex=False).str.strip()
+    )
     df = df[df["Description"].isin(TARGET_DESCRIPTIONS)].copy()
     df["Date"] = pd.to_datetime(df["Date"])
     return df[(df["Date"] >= start_day) & (df["Date"] <= end_day)]
